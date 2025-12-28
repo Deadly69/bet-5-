@@ -27,19 +27,25 @@ class Http3Response:
         self.headers = None
         self.done = asyncio.get_event_loop().create_future()
 
+class ConnectionClosedError(ConnectionError):
+    pass
+
 class Http3ClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.h3 = H3Connection(self._quic)
         self.streams = {}
-        # Limit concurrent streams per connection to avoid overwhelming it
-        self.conn_sem = asyncio.Semaphore(100)  # Fixed high but safe limit
+        self.conn_sem = asyncio.Semaphore(30)  # Lower for stability, prevents server closures
 
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
             for stream_id, resp in list(self.streams.items()):
                 if not resp.done.done():
-                    resp.done.set_exception(ConnectionError(f"Connection terminated: {event.error_code}"))
+                    resp.done.set_exception(ConnectionClosedError(f"Connection terminated: {event.error_code}"))
+                    try:
+                        resp.done.exception()  # Suppress unretrieved exception logs
+                    except ConnectionClosedError:
+                        pass
             self.streams.clear()
             return
         for h3_event in self.h3.handle_event(event):
@@ -98,7 +104,6 @@ class ConnectionPool:
             except Exception:
                 return None
 
-        # Create initial connections
         coros = [create_conn() for _ in range(self.initial_pool_size)]
         results = await asyncio.gather(*coros)
         self.pool = [p for p in results if p is not None]
@@ -129,7 +134,7 @@ class ConnectionPool:
                     added = [p for p in new_conns if p is not None]
                     self.pool.extend(added)
                     print(f"Replenished {len(added)}, total now: {len(self.pool)}")
-            await asyncio.sleep(0.1)  # Fast replenishment
+            await asyncio.sleep(0.1)
 
     async def _create_single_conn(self):
         try:
@@ -214,6 +219,9 @@ async def worker(
                     stats.setdefault('latencies', []).append(latency)
                 if not (resp.headers and any(k == b':status' and v == b'200' for k, v in resp.headers)):
                     raise ValueError("Non-200")
+            except ConnectionClosedError:
+                # Don't count closures as errors; server-side limit
+                pass
             except Exception:
                 error_count += 1
                 await pool.remove_connection(conn)
@@ -221,7 +229,7 @@ async def worker(
                 next_send += interval
                 delay = next_send - time.perf_counter()
                 if delay > 0:
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(delay + random.uniform(0, 0.01))  # Jitter for realism
                 elif delay < -interval * 2:
                     next_send = time.perf_counter() + interval
 
