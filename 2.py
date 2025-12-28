@@ -3,14 +3,15 @@ import asyncio
 import ssl
 import time
 import argparse
+import random
 from urllib.parse import urlparse
 from contextlib import AsyncExitStack
 from typing import List
-import random
+
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3_ALPN, H3Connection
-from aioquic.h3.events import HeadersReceived, DataReceived
+from aioquic.h3.events import HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated
 from aioquic.tls import CipherSuite
@@ -19,7 +20,31 @@ try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
-    print("Warning: uvloop not installed. Install for better performance: pip install uvloop")
+    print("Warning: uvloop not installed → pip install uvloop for better performance")
+
+# ------------------------------------------------------------
+# Realistic Chrome header pool (Chrome 131 era)
+# ------------------------------------------------------------
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+]
+
+SEC_CH_UA_VARIANTS = [
+    '"Google Chrome";v="131", "Chromium";v="131", "Not=A?Brand";v="24"',
+    '"Chromium";v="131", "Google Chrome";v="131", "Not=A?Brand";v="24"',
+    '"Not=A?Brand";v="24", "Chromium";v="131", "Google Chrome";v="131"',
+]
+
+ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9,en-US;q=0.8",
+    "en,en-US;q=0.9",
+    "fr-FR,fr;q=0.9,en;q=0.8",
+    "de-DE,de;q=0.9,en;q=0.8",
+]
 
 class Http3Response:
     __slots__ = ('headers', 'done')
@@ -35,19 +60,21 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.h3 = H3Connection(self._quic)
         self.streams = {}
-        self.conn_sem = asyncio.Semaphore(30)  # Lower for stability, prevents server closures
+        # Conservative limit – very important for Cloudflare stability
+        self.conn_sem = asyncio.Semaphore(15)
 
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
             for stream_id, resp in list(self.streams.items()):
                 if not resp.done.done():
-                    resp.done.set_exception(ConnectionClosedError(f"Connection terminated: {event.error_code}"))
+                    resp.done.set_exception(ConnectionClosedError("Connection terminated"))
                     try:
-                        resp.done.exception()  # Suppress unretrieved exception logs
-                    except ConnectionClosedError:
+                        resp.done.exception()  # suppress unretrieved warning
+                    except:
                         pass
             self.streams.clear()
             return
+
         for h3_event in self.h3.handle_event(event):
             sid = getattr(h3_event, "stream_id", None)
             if sid not in self.streams:
@@ -55,12 +82,11 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             resp = self.streams[sid]
             if isinstance(h3_event, HeadersReceived):
                 resp.headers = h3_event.headers
-            elif isinstance(h3_event, DataReceived):
                 if h3_event.stream_ended:
                     resp.done.set_result(True)
                     self.streams.pop(sid, None)
 
-    async def send_request(self, headers: List[tuple], timeout: float = 15.0) -> Http3Response:
+    async def send_request(self, headers: List[tuple], timeout: float = 20.0):
         async with self.conn_sem:
             stream_id = self._quic.get_next_available_stream_id()
             resp = Http3Response()
@@ -94,7 +120,7 @@ class ConnectionPool:
                     self.port,
                     configuration=self.config,
                     create_protocol=Http3ClientProtocol,
-                    wait_connected=True
+                    wait_connected=True,
                 )
                 protocol = await asyncio.wait_for(
                     self._stack.enter_async_context(cm),
@@ -109,9 +135,9 @@ class ConnectionPool:
         self.pool = [p for p in results if p is not None]
 
         if not self.pool:
-            raise RuntimeError("Không thể thiết lập bất kỳ kết nối nào!")
+            raise RuntimeError("Failed to establish any connections!")
 
-        print(f"✓ Đã tạo {len(self.pool)}/{self.initial_pool_size} kết nối thành công")
+        print(f"✓ Created {len(self.pool)}/{self.initial_pool_size} connections")
         self._maintainer_task = asyncio.create_task(self._maintainer())
         return self
 
@@ -127,36 +153,33 @@ class ConnectionPool:
             async with self._lock:
                 current = len(self.pool)
                 if current < self.initial_pool_size:
-                    needed = min(10, self.initial_pool_size - current)
-                    print(f"Pool low: {current}/{self.initial_pool_size}, creating {needed} more...")
-                    coros = [self._create_single_conn() for _ in range(needed)]
-                    new_conns = await asyncio.gather(*coros)
-                    added = [p for p in new_conns if p is not None]
+                    needed = min(15, self.initial_pool_size - current)
+                    coros = [self._create_single() for _ in range(needed)]
+                    new = await asyncio.gather(*coros)
+                    added = [p for p in new if p is not None]
                     self.pool.extend(added)
-                    print(f"Replenished {len(added)}, total now: {len(self.pool)}")
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
 
-    async def _create_single_conn(self):
+    async def _create_single(self):
         try:
             cm = connect(
                 self.host,
                 self.port,
                 configuration=self.config,
                 create_protocol=Http3ClientProtocol,
-                wait_connected=True
+                wait_connected=True,
             )
-            protocol = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._stack.enter_async_context(cm),
                 timeout=12.0
             )
-            return protocol
         except Exception:
             return None
 
     async def get_connection(self) -> Http3ClientProtocol:
         async with self._lock:
             if not self.pool:
-                raise RuntimeError("No connections available in pool")
+                raise RuntimeError("No connections in pool")
             return random.choice(self.pool)
 
     async def remove_connection(self, protocol: Http3ClientProtocol):
@@ -167,7 +190,7 @@ class ConnectionPool:
                     protocol.close()
                 except:
                     pass
-                print(f"Removed bad connection. Pool size: {len(self.pool)}")
+                print(f"Removed bad connection → Pool size: {len(self.pool)}")
 
 class AtomicCounter:
     def __init__(self):
@@ -180,92 +203,94 @@ class AtomicCounter:
         async with self._lock:
             return self._value
 
-async def worker(
-    worker_id: int,
-    pool: ConnectionPool,
-    headers: List[tuple],
-    duration: float,
-    counter: AtomicCounter,
-    stats: dict,
-    semaphore: asyncio.Semaphore,
-    interval: float
-):
+def build_headers(host: str, path: str) -> List[tuple]:
+    ua = random.choice(USER_AGENTS)
+    sec_ch_ua = random.choice(SEC_CH_UA_VARIANTS)
+    lang = random.choice(ACCEPT_LANGUAGES)
+
+    return [
+        (b":method", b"GET"),
+        (b":authority", host.encode()),
+        (b":scheme", b"https"),
+        (b":path", path.encode()),
+        (b"user-agent", ua.encode()),
+        (b"accept", b"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
+        (b"accept-language", lang.encode()),
+        (b"accept-encoding", b"gzip, deflate, br, zstd"),
+        (b"sec-ch-ua", sec_ch_ua.encode()),
+        (b"sec-ch-ua-mobile", b"?0"),
+        (b"sec-ch-ua-platform", b'"Windows"'),
+        (b"upgrade-insecure-requests", b"1"),
+        (b"sec-fetch-site", b"none"),
+        (b"sec-fetch-mode", b"navigate"),
+        (b"sec-fetch-user", b"?1"),
+        (b"sec-fetch-dest", b"document"),
+        (b"priority", b"u=0, i"),
+        (b"cache-control", b"no-cache"),
+    ]
+
+async def worker(pool, headers, duration, counter, stats, semaphore, interval):
     end_time = time.perf_counter() + duration
-    request_count = 0
-    error_count = 0
+    requests = errors = 0
     next_send = time.perf_counter()
 
     while next_send < end_time:
         async with semaphore:
             conn = None
-            for _ in range(5):
+            for _ in range(6):
                 try:
                     conn = await pool.get_connection()
                     break
                 except RuntimeError:
                     await asyncio.sleep(0.05)
             if not conn:
-                error_count += 1
+                errors += 1
                 next_send += interval
                 continue
 
             try:
                 start = time.perf_counter()
-                resp = await conn.send_request(headers, timeout=15.0)
+                resp = await conn.send_request(headers)
                 latency = (time.perf_counter() - start) * 1000
                 await counter.increment()
-                request_count += 1
-                if request_count % 10 == 0:
+                requests += 1
+                if requests % 10 == 0:
                     stats.setdefault('latencies', []).append(latency)
-                if not (resp.headers and any(k == b':status' and v == b'200' for k, v in resp.headers)):
-                    raise ValueError("Non-200")
+
+                # Treat non-200 as error only if not Cloudflare challenge (optional)
+                status = next((v for k, v in resp.headers if k == b":status"), None)
+                if status not in (b"200", b"301", b"302"):
+                    raise ValueError(f"Status {status.decode()}")
             except ConnectionClosedError:
-                # Don't count closures as errors; server-side limit
-                pass
+                pass  # normal server limit
             except Exception:
-                error_count += 1
+                errors += 1
                 await pool.remove_connection(conn)
             finally:
                 next_send += interval
                 delay = next_send - time.perf_counter()
                 if delay > 0:
-                    await asyncio.sleep(delay + random.uniform(0, 0.01))  # Jitter for realism
+                    await asyncio.sleep(delay + random.uniform(0.005, 0.02))
                 elif delay < -interval * 2:
                     next_send = time.perf_counter() + interval
 
     async with stats['_lock']:
-        stats['total_requests'] = stats.get('total_requests', 0) + request_count
-        stats['total_errors'] = stats.get('total_errors', 0) + error_count
-
-def build_headers(host: str, path: str) -> List[tuple]:
-    return [
-        (b":method", b"GET"),
-        (b":scheme", b"https"),
-        (b":authority", host.encode()),
-        (b":path", path.encode()),
-        (b"user-agent", b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-        (b"accept", b"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
-        (b"sec-ch-ua", b'"Chromium";v="131", "Google Chrome";v="131"'),
-        (b"sec-ch-ua-mobile", b"?0"),
-        (b"sec-ch-ua-platform", b'"Windows"'),
-        (b"accept-encoding", b"gzip, deflate, br, zstd"),
-        (b"accept-language", b"en-US,en;q=0.9"),
-        (b"cache-control", b"no-cache"),
-    ]
+        stats['requests'] = stats.get('requests', 0) + requests
+        stats['errors'] = stats.get('errors', 0) + errors
 
 async def main():
-    parser = argparse.ArgumentParser(description="Maximized RPS HTTP/3 Load Tester")
-    parser.add_argument("--url", required=True, help="Target URL (HTTPS only)")
+    parser = argparse.ArgumentParser(description="Educational HTTP/3 Load Tester (Cloudflare-friendly)")
+    parser.add_argument("--url", required=True, help="Target URL (https only)")
     parser.add_argument("--rps", type=int, required=True, help="Target requests per second")
-    parser.add_argument("--workers", type=int, default=500, help="Number of worker tasks")
-    parser.add_argument("--connections", type=int, default=100, help="QUIC connections in pool")
-    parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds")
-    parser.add_argument("--max-concurrency", type=int, default=2000, help="Max concurrent requests")
+    parser.add_argument("--workers", type=int, default=400, help="Worker tasks")
+    parser.add_argument("--connections", type=int, default=200, help="QUIC connection pool size")
+    parser.add_argument("--duration", type=int, default=60, help="Test duration (seconds)")
+    parser.add_argument("--max-concurrency", type=int, default=1500, help="Max concurrent requests")
     args = parser.parse_args()
 
     parsed = urlparse(args.url)
     if parsed.scheme != "https":
-        raise SystemExit("Error: Only HTTPS URLs are supported.")
+        sys.exit("Only HTTPS URLs supported")
 
     config = QuicConfiguration(
         is_client=True,
@@ -276,62 +301,50 @@ async def main():
             CipherSuite.AES_256_GCM_SHA384,
             CipherSuite.CHACHA20_POLY1305_SHA256,
         ],
-        max_data=100 * 1024 * 1024,
-        max_stream_data=50 * 1024 * 1024,
-        idle_timeout=60.0,
-        max_datagram_frame_size=65535,
+        max_data=200 * 1024 * 1024,
+        max_stream_data=100 * 1024 * 1024,
+        idle_timeout=120.0,
     )
 
-    print(f"Starting load test for {args.duration}s at {args.rps} RPS...")
-    print(f"Workers: {args.workers} | Connections: {args.connections} | Max concurrency: {args.max_concurrency}")
+    print(f"Testing {args.url} → {args.rps} RPS for {args.duration}s")
+    print(f"Workers: {args.workers} | Connections: {args.connections}")
 
-    async with ConnectionPool(
-        host=parsed.hostname,
-        port=parsed.port or 443,
-        config=config,
-        pool_size=args.connections
-    ) as pool:
+    async with ConnectionPool(parsed.hostname, parsed.port or 443, config, args.connections) as pool:
         headers = build_headers(parsed.hostname, parsed.path or "/")
         counter = AtomicCounter()
-        stats = {'_lock': asyncio.Lock(), 'total_requests': 0, 'total_errors': 0}
+        stats = {'_lock': asyncio.Lock(), 'requests': 0, 'errors': 0}
         semaphore = asyncio.Semaphore(args.max_concurrency)
-        per_worker_rps = args.rps / args.workers if args.workers else args.rps
-        interval = 1.0 / per_worker_rps if per_worker_rps > 0 else 0.01
+        interval = 1.0 / (args.rps / args.workers)
 
-        start_time = time.perf_counter()
-        tasks = [asyncio.create_task(worker(i, pool, headers, args.duration, counter, stats, semaphore, interval))
-                 for i in range(args.workers)]
+        start = time.perf_counter()
+        tasks = [asyncio.create_task(worker(pool, headers, args.duration, counter, stats, semaphore, interval))
+                 for _ in range(args.workers)]
 
         async def monitor():
             last = 0
-            last_t = start_time
+            last_t = start
             while any(not t.done() for t in tasks):
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 curr = await counter.get_value()
                 now = time.perf_counter()
                 rps = (curr - last) / (now - last_t) if (now - last_t) > 0 else 0
-                print(f"Progress: {curr} req | RPS: {rps:.1f} | Errors: {stats.get('total_errors',0)} | Pool: {len(pool.pool)}")
+                print(f"Requests: {curr} | RPS: {rps:.1f} | Errors: {stats.get('errors',0)} | Pool: {len(pool.pool)}")
                 last, last_t = curr, now
 
         monitor_task = asyncio.create_task(monitor())
         await asyncio.gather(*tasks)
         monitor_task.cancel()
 
-        total_time = time.perf_counter() - start_time
-        total_req = await counter.get_value()
-        avg_rps = total_req / total_time if total_time else 0
-
+        total_time = time.perf_counter() - start
+        total = await counter.get_value()
         print("\n" + "="*60)
-        print("LOAD TEST COMPLETE")
-        print("="*60)
-        print(f"Runtime: {total_time:.2f}s")
-        print(f"Total requests: {total_req}")
-        print(f"Average RPS: {avg_rps:.2f} (Target: {args.rps})")
-        print(f"Effectiveness: {(avg_rps/args.rps*100):.1f}%")
-        print(f"Total errors: {stats.get('total_errors', 0)}")
+        print("TEST COMPLETE")
+        print(f"Total requests: {total}")
+        print(f"Avg RPS: {total/total_time:.1f} (target {args.rps})")
+        print(f"Errors: {stats.get('errors', 0)}")
         if stats.get('latencies'):
             lats = stats['latencies']
-            print(f"Latency (ms): Avg={sum(lats)/len(lats):.1f} | P95={sorted(lats)[int(0.95*len(lats))]:.1f}")
+            print(f"Latency (ms): Avg {sum(lats)/len(lats):.1f} | P95 {sorted(lats)[int(0.95*len(lats))]:.1f}")
 
 if __name__ == "__main__":
     asyncio.run(main())
