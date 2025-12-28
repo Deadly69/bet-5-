@@ -1,0 +1,40 @@
+name: Run Python
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        required: true
+        type: string
+      rps:
+        required: true
+        type: number
+      time:
+        required: true
+        type: number
+
+jobs:
+  ran:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install aioquic uvloop
+
+      - run: |
+          TIME=${{ inputs.time }}
+          timeout $TIME python3 2.py \
+            --url "${{ inputs.url }}" \
+            --rps "${{ inputs.rps }}" \
+            --duration "$((TIME+60))" \
+            --connections 100 \
+            --workers 300
