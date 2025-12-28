@@ -36,6 +36,6 @@ jobs:
             --url "${{ inputs.url }}" \
             --rps "${{ inputs.rps }}" \
             --duration "$((TIME+60))" \
-            --connections 500 \
-            --workers 500
+            --connections 300 \
+            --workers 300
             --max-concurrency 800
