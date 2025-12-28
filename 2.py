@@ -61,7 +61,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.h3 = H3Connection(self._quic)
         self.streams = {}
         # Conservative limit – very important for Cloudflare stability
-        self.conn_sem = asyncio.Semaphore(15)
+        self.conn_sem = asyncio.Semaphore(8)
 
     def quic_event_received(self, event):
         if isinstance(event, ConnectionTerminated):
@@ -270,7 +270,7 @@ async def worker(pool, headers, duration, counter, stats, semaphore, interval):
                 next_send += interval
                 delay = next_send - time.perf_counter()
                 if delay > 0:
-                    await asyncio.sleep(delay + random.uniform(0.005, 0.02))
+                    await asyncio.sleep(delay + random.uniform(0.05, 0.2))
                 elif delay < -interval * 2:
                     next_send = time.perf_counter() + interval
 
