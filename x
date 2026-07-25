@@ -50,7 +50,7 @@
 #       - Telegram Bot ID, =5794110125:AAFDNb...
 # GS_TG_CHATID=
 #       - Telegram Chat ID, =-8834838...
- GS_DISCORD_KEY=
+# GS_DISCORD_KEY=
 #       - Discord API key, ="1529113837859504210/Ug-z4YS-aBVSeGVU7YJKaldmOd5c4wgyBH9Y5Iq_-vaXUC2RuD3o7BXJIwQy0DWarg_L"
 # GS_WEBHOOK_KEY=
 #       - https://webhook.site key, ="dc3c1af9-ea3d-4401-9158-eb6dda735276"
